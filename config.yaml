@@ -1,0 +1,79 @@
+# Weather ETL. ${VAR} and ${VAR:-default} expand from the environment.
+# A .env file next to this config is loaded first. Existing environment
+# variables win. Empty values fall through to the default.
+
+app:
+  name: weather-etl
+  heartbeat_file: data/heartbeat.txt
+
+schedule:
+  # Cron is evaluated in this timezone. Stored observations stay in UTC.
+  timezone: UTC
+  cron:
+    minute: "0"
+    hour: "6"
+    day: "*"
+    month: "*"
+    day_of_week: "*"
+  run_on_start: true
+  misfire_grace_seconds: 3600
+
+ingest:
+  # Later sources override earlier ones for the same location and timestamp.
+  # Null measurements keep the earlier value.
+  sources:
+    - csv
+    - api
+  csv:
+    inbox_dir: data/inbox
+    pattern: "*.csv"
+    archive_dir: data/archive
+  api:
+    base_url: https://api.open-meteo.com/v1/forecast
+    timeout_seconds: 30
+    retries: 3
+    backoff_seconds: 2
+    past_days: 7
+    forecast_days: 1
+    hourly_variables:
+      - temperature_2m
+      - relative_humidity_2m
+      - precipitation
+      - wind_speed_10m
+    locations:
+      - name: New York
+        latitude: 40.7128
+        longitude: -74.0060
+      - name: London
+        latitude: 51.5074
+        longitude: -0.1278
+      - name: Tokyo
+        latitude: 35.6762
+        longitude: 139.6503
+
+database:
+  url: sqlite:///data/weather.db
+
+report:
+  output_dir: output/reports
+  lookback_days: 14
+
+email:
+  enabled: false
+  smtp_host: ${SMTP_HOST:-}
+  smtp_port: ${SMTP_PORT:-587}
+  smtp_user: ${SMTP_USER:-}
+  smtp_password: ${SMTP_PASSWORD:-}
+  use_tls: ${SMTP_USE_TLS:-true}
+  use_ssl: ${SMTP_USE_SSL:-false}
+  from_addr: ${SMTP_FROM:-}
+  to_addrs:
+    - ${SMTP_TO:-}
+  timeout_seconds: 30
+  subject: "Daily weather report {date}"
+
+logging:
+  level: INFO
+  file: logs/etl.log
+  max_bytes: 5242880
+  backup_count: 5
