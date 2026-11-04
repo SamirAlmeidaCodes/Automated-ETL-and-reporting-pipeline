@@ -1,7 +1,9 @@
-pandas>=2.2,<3
-SQLAlchemy>=2.0,<3
-APScheduler>=3.10,<4
-matplotlib>=3.8,<4
-PyYAML>=6.0,<7
-requests>=2.31,<3
-python-dotenv>=1.0,<2
+# Pinned for repeatable installs. Check them with scripts/audit_dependencies.sh.
+pandas==2.3.3
+SQLAlchemy==2.1.6
+APScheduler==3.11.3
+matplotlib==3.11.2
+PyYAML==6.0.3
+requests==2.34.2
+python-dotenv==1.2.4
+pydantic==2.14.2

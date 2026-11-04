@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -9,11 +10,14 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 import requests
+from pydantic import ValidationError
 
 from etl import __version__
 from etl.config import ApiConfig, LocationConfig
 from etl.errors import IngestError
+from etl.redaction import public_text
 from etl.retry import RetryableFetchError, call_with_retry
+from etl.validation import MAX_HTTP_BYTES, OpenMeteoHourly
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,7 @@ def fetch_weather(api: ApiConfig, app_name: str) -> ApiReadResult:
     frames: list[pd.DataFrame] = []
     failures: list[str] = []
     with requests.Session() as session:
+        session.max_redirects = 0
         session.headers.update(
             {
                 "User-Agent": _user_agent(app_name),
@@ -76,21 +81,38 @@ def _fetch_location(session: requests.Session, api: ApiConfig, location: Locatio
 
     def once() -> pd.DataFrame:
         try:
-            response = session.get(api.base_url, params=params, timeout=api.timeout_seconds)
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            raise RetryableFetchError(f"{location.name}: {exc}") from exc
-        if response.status_code in RETRYABLE_STATUS:
-            raise RetryableFetchError(f"{location.name}: HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise IngestError(
-                f"Open-Meteo rejected {location.name} (HTTP {response.status_code}): {_error_text(response)}"
+            response = session.get(
+                api.base_url,
+                params=params,
+                timeout=api.timeout_seconds,
+                allow_redirects=False,
+                stream=True,
             )
+        except (requests.Timeout, requests.ConnectionError):
+            raise RetryableFetchError(f"{location.name}: temporary network error") from None
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RetryableFetchError(f"{location.name}: response was not JSON") from exc
+            if response.status_code in RETRYABLE_STATUS:
+                raise RetryableFetchError(f"{location.name}: HTTP {response.status_code}")
+            if response.status_code >= 300:
+                reason = _safe_error_reason(response)
+                message = f"Open-Meteo rejected {location.name} (HTTP {response.status_code})"
+                if reason:
+                    message = f"{message}: {reason}"
+                raise IngestError(message)
+            try:
+                raw = _read_limited(response)
+            except IngestError:
+                raise IngestError(f"Open-Meteo response for {location.name} was too large") from None
+            except UnicodeError:
+                raise RetryableFetchError(f"{location.name}: response was not JSON") from None
+            try:
+                payload = json.loads(raw)
+            except (UnicodeError, json.JSONDecodeError):
+                raise RetryableFetchError(f"{location.name}: response was not JSON") from None
+        finally:
+            response.close()
         if isinstance(payload, dict) and payload.get("error"):
-            reason = str(payload.get("reason") or "unknown error")
+            reason = public_text(payload.get("reason") or "unknown error", limit=120)
             raise IngestError(f"Open-Meteo rejected {location.name}: {reason}")
         return _frame_from_payload(location.name, payload, api.hourly_variables)
 
@@ -112,37 +134,53 @@ def _fetch_location(session: requests.Session, api: ApiConfig, location: Locatio
 def _frame_from_payload(location_name: str, payload: object, variables: tuple[str, ...]) -> pd.DataFrame:
     if not isinstance(payload, dict):
         raise IngestError(f"Open-Meteo response for {location_name} was not a JSON object")
-    hourly = payload.get("hourly")
-    if not isinstance(hourly, dict) or "time" not in hourly:
-        raise IngestError(f"Open-Meteo response for {location_name} is missing hourly.time")
-    times = hourly["time"]
-    if not isinstance(times, list):
-        raise IngestError(f"Open-Meteo hourly.time for {location_name} was not a list")
+    try:
+        hourly = OpenMeteoHourly.model_validate(payload.get("hourly"))
+    except ValidationError:
+        raise IngestError(f"Open-Meteo response for {location_name} was incomplete") from None
     data: dict[str, object] = {
         "location": location_name,
-        "timestamp": times,
+        "timestamp": hourly.time,
         "source": "api",
     }
+    series = hourly.__pydantic_extra__ or {}
     for variable in variables:
-        values = hourly.get(variable)
+        values = series.get(variable)
         if not isinstance(values, list):
             raise IngestError(f"Open-Meteo response for {location_name} is missing hourly.{variable}")
-        if len(values) != len(times):
-            raise IngestError(
-                f"Open-Meteo hourly.{variable} for {location_name} has {len(values)} values for {len(times)} times"
-            )
         data[variable] = values
     return pd.DataFrame(data)
 
 
-def _error_text(response: requests.Response) -> str:
+def _read_limited(response: requests.Response) -> str:
+    declared = response.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_HTTP_BYTES:
+                raise IngestError("response was too large")
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65_536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_HTTP_BYTES:
+            raise IngestError("response was too large")
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8")
+
+
+def _safe_error_reason(response: requests.Response) -> str:
     try:
-        payload = response.json()
-    except ValueError:
-        return response.text[:300]
+        raw = _read_limited(response)
+        payload = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, IngestError, ValueError):
+        return ""
     if isinstance(payload, dict) and payload.get("reason"):
-        return str(payload["reason"])[:300]
-    return response.text[:300]
+        return public_text(payload["reason"], limit=120)
+    return ""
 
 
 def _user_agent(app_name: str) -> str:

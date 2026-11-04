@@ -9,14 +9,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from etl.config import AppConfig
-from etl.errors import ConfigError, TransformError
+from etl.errors import ConfigError, EtlError, TransformError
 from etl.heartbeat import write_heartbeat
 from etl.ingest import extract
 from etl.ingest.csv_source import archive_files
 from etl.load.repository import create_db_engine, fetch_daily, upsert_daily
+from etl.redaction import redact_text
 from etl.report.charts import render_report
 from etl.report.emailer import ReportContext, send_report
-from etl.runtime import bootstrap, parse_args
+from etl.runtime import bootstrap, harden_process, parse_args
 from etl.transform.weather import aggregate_daily, prepare_hourly
 
 logger = logging.getLogger(__name__)
@@ -87,12 +88,12 @@ def _run_pipeline(config: AppConfig) -> PipelineResult:
 
     try:
         archive_files(extracted.csv_files, config.ingest.csv.archive_dir)
-    except OSError as exc:
-        extracted.warnings.append(f"csv archive: {exc}")
-        logger.exception("Could not archive CSV files; they will be read again on the next run")
+    except OSError:
+        extracted.warnings.append("csv archive: could not move processed files")
+        logger.error("Could not archive CSV files; they will be read again on the next run")
 
     chart_paths = render_report(report_frame, config.report.output_dir, generated_at.date())
-    logger.info("Wrote charts: %s", ", ".join(str(path) for path in chart_paths))
+    logger.info("Wrote charts: %s", ", ".join(path.name for path in chart_paths))
 
     emailed = False
     if config.email.enabled:
@@ -129,6 +130,7 @@ def _run_pipeline(config: AppConfig) -> PipelineResult:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the pipeline once and return a process exit code."""
+    harden_process()
     args = parse_args(
         argv,
         prog="etl",
@@ -137,11 +139,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = bootstrap(args.config)
     except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        print(f"Configuration error: {redact_text(str(exc))}", file=sys.stderr)
         return 2
     try:
         result = run_pipeline(config)
+    except EtlError as exc:
+        logger.error("ETL run failed: %s", redact_text(str(exc)))
+        return 1
     except Exception:
-        logger.exception("ETL run failed")
+        logger.error("ETL run failed due to an unexpected error")
         return 1
     return 1 if result.warnings else 0

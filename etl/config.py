@@ -11,15 +11,20 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+from pydantic import ValidationError
 
 from etl.errors import ConfigError
+from etl.redaction import register_secret
 from etl.schema import OPEN_METEO_VARIABLES
+from etl.validation import ApiEndpoint, CronField, EmailSettings, SqliteUrl
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _SUPPORTED_SOURCES = ("csv", "api")
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _TRUE = {"1", "true", "yes", "y", "on"}
 _FALSE = {"0", "false", "no", "n", "off"}
+# DEBUG is kept only for an explicit local environment. Everything else is production.
+_DEV_ENVS = {"dev", "development", "test"}
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,7 @@ class LoggingConfig:
     file: Path
     max_bytes: int
     backup_count: int
+    debug_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,16 +144,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     """Read the YAML config. Relative paths are resolved from the file's directory."""
     config_path = _config_path(path)
     if not config_path.is_file():
-        raise ConfigError(f"Config file not found: {config_path}")
+        raise ConfigError("Config file not found")
     try:
         raw_text = config_path.read_text(encoding="utf-8")
         loaded = yaml.safe_load(raw_text)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"Could not parse {config_path}: {exc}") from exc
+        raise ConfigError("Could not parse the config file") from exc
     except OSError as exc:
-        raise ConfigError(f"Could not read {config_path}: {exc}") from exc
+        raise ConfigError("Could not read the config file") from exc
     if not isinstance(loaded, dict):
         raise ConfigError(f"{config_path} must contain a mapping at the top level")
+    _reject_literal_secrets(loaded)
     data = _interpolate(loaded)
     base_dir = config_path.parent
     return AppConfig(
@@ -182,6 +189,27 @@ def _interpolate(value: Any) -> Any:
     return value
 
 
+def _reject_literal_secrets(raw: dict[str, Any]) -> None:
+    """SMTP password must be an environment placeholder, never a literal."""
+    email = raw.get("email")
+    if not isinstance(email, dict):
+        return
+    _require_env_placeholder(email.get("smtp_password"), field="email.smtp_password")
+
+
+def _require_env_placeholder(value: Any, *, field: str) -> None:
+    if value is None or value == "":
+        return
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} must be set from an environment variable")
+    match = _ENV_PATTERN.fullmatch(value.strip())
+    if match is None:
+        raise ConfigError(f"{field} must be set from an environment variable")
+    # ${VAR:-secret} would commit the secret as the default. An empty default is fine.
+    if match.group(2):
+        raise ConfigError(f"{field} must not include a default secret")
+
+
 def _replace_env(match: re.Match[str]) -> str:
     name = match.group(1)
     has_default = match.group(2) is not None
@@ -208,8 +236,8 @@ def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
 def _parse_app(data: dict[str, Any], base_dir: Path) -> AppInfo:
     section = _section(data, "app")
     name = _as_str(section.get("name"), field="app.name", default="weather-etl")
-    if any(char in name for char in "\r\n"):
-        raise ConfigError("app.name must be a single line")
+    if len(name) > 64:
+        raise ConfigError("app.name is too long")
     heartbeat = _resolve_path(
         _as_str(section.get("heartbeat_file"), field="app.heartbeat_file", default="data/heartbeat.txt"),
         base_dir,
@@ -270,8 +298,15 @@ def _parse_ingest(data: dict[str, Any], base_dir: Path) -> IngestConfig:
         base_dir,
     )
     pattern = _as_str(csv_section.get("pattern"), field="ingest.csv.pattern", default="*.csv")
-    if not pattern or "/" in pattern or "\\" in pattern or ".." in pattern:
-        raise ConfigError("ingest.csv.pattern must be a filename glob such as *.csv")
+    if (
+        not pattern
+        or not pattern.endswith(".csv")
+        or "/" in pattern
+        or "\\" in pattern
+        or ".." in pattern
+        or pattern.startswith("~")
+    ):
+        raise ConfigError("ingest.csv.pattern must be a filename glob ending in .csv")
     if inbox == archive or _is_inside(archive, inbox) or _is_inside(inbox, archive):
         raise ConfigError("ingest.csv inbox_dir and archive_dir must be separate directories")
     api = _parse_api(api_section, require_locations="api" in sources)
@@ -308,8 +343,10 @@ def _parse_api(section: dict[str, Any], *, require_locations: bool) -> ApiConfig
         field="ingest.api.base_url",
         default="https://api.open-meteo.com/v1/forecast",
     )
-    if not (base_url.startswith("https://") or base_url.startswith("http://")):
-        raise ConfigError("ingest.api.base_url must start with http:// or https://")
+    try:
+        base_url = ApiEndpoint(base_url=base_url).base_url
+    except ValidationError:
+        raise ConfigError("ingest.api.base_url must be an https URL without credentials") from None
     variables = section.get("hourly_variables", list(OPEN_METEO_VARIABLES))
     if not isinstance(variables, list) or not variables:
         raise ConfigError("ingest.api.hourly_variables must be a non-empty list")
@@ -341,6 +378,7 @@ def _parse_api(section: dict[str, Any], *, require_locations: bool) -> ApiConfig
             field="ingest.api.timeout_seconds",
             default=30.0,
             minimum=1.0,
+            maximum=300.0,
         ),
         retries=_as_int(section.get("retries"), field="ingest.api.retries", default=3, minimum=1, maximum=8),
         backoff_seconds=_as_float(
@@ -378,6 +416,8 @@ def _parse_locations(value: Any) -> list[LocationConfig]:
         if math.isnan(longitude) or math.isinf(longitude) or not -180 <= longitude <= 180:
             raise ConfigError(f"Longitude for {name} must be between -180 and 180")
         locations.append(LocationConfig(name=name, latitude=latitude, longitude=longitude))
+    if len(locations) > 100:
+        raise ConfigError("ingest.api.locations cannot list more than 100 locations")
     return locations
 
 
@@ -391,12 +431,22 @@ def _parse_database(data: dict[str, Any], base_dir: Path) -> DatabaseConfig:
 
 def _resolve_sqlite_url(url: str, base_dir: Path) -> str:
     raw_path = url[len("sqlite:///") :]
-    if raw_path in {":memory:", ""} or raw_path.startswith("file:"):
-        return url
+    if raw_path == ":memory:":
+        try:
+            return SqliteUrl(url=url).url
+        except ValidationError:
+            raise ConfigError("database.url must be a sqlite:/// URL") from None
+    if not raw_path or raw_path.startswith("file:"):
+        raise ConfigError("database.url must point at a database file")
     path = Path(raw_path)
     if not path.is_absolute():
         path = (base_dir / path).resolve()
-    return "sqlite:///" + path.as_posix()
+    else:
+        path = path.resolve()
+    try:
+        return SqliteUrl(url="sqlite:///" + path.as_posix()).url
+    except ValidationError:
+        raise ConfigError("database.url must be a sqlite:/// URL") from None
 
 
 def _parse_report(data: dict[str, Any], base_dir: Path) -> ReportConfig:
@@ -431,7 +481,13 @@ def _parse_email(data: dict[str, Any]) -> EmailConfig:
     recipients = _parse_recipients(section.get("to_addrs", []))
     subject = _as_str(section.get("subject"), field="email.subject", default="Daily weather report {date}")
     port = _as_int(section.get("smtp_port"), field="email.smtp_port", default=587, minimum=1, maximum=65535)
-    timeout = _as_float(section.get("timeout_seconds"), field="email.timeout_seconds", default=30.0, minimum=1.0)
+    timeout = _as_float(
+        section.get("timeout_seconds"),
+        field="email.timeout_seconds",
+        default=30.0,
+        minimum=1.0,
+        maximum=300.0,
+    )
     if enabled:
         if not host:
             raise ConfigError("email.smtp_host is required when email is enabled")
@@ -440,8 +496,27 @@ def _parse_email(data: dict[str, Any]) -> EmailConfig:
         if not recipients:
             raise ConfigError("email.to_addrs must list at least one recipient when email is enabled")
         for recipient in recipients:
+            if any(character in recipient for character in "\r\n\x00"):
+                raise ConfigError("email.to_addrs contains an invalid address")
             if "@" not in recipient:
                 raise ConfigError(f"Invalid recipient address {recipient!r}")
+    register_secret(password)
+    try:
+        EmailSettings(
+            enabled=enabled,
+            smtp_host=host,
+            smtp_port=port,
+            smtp_user=user,
+            smtp_password=password,
+            use_tls=use_tls,
+            use_ssl=use_ssl,
+            from_addr=sender,
+            to_addrs=tuple(recipients),
+            timeout_seconds=timeout,
+            subject=subject,
+        )
+    except ValidationError:
+        raise ConfigError("email settings are invalid") from None
     return EmailConfig(
         enabled=enabled,
         smtp_host=host,
@@ -477,9 +552,15 @@ def _parse_recipients(value: Any) -> list[str]:
 
 def _parse_logging(data: dict[str, Any], base_dir: Path) -> LoggingConfig:
     section = _section(data, "logging")
-    level = _as_str(section.get("level"), field="logging.level", default="INFO").upper()
-    if level not in _LOG_LEVELS:
+    requested = _as_str(section.get("level"), field="logging.level", default="INFO").upper()
+    if requested not in _LOG_LEVELS:
         raise ConfigError(f"logging.level must be one of {', '.join(sorted(_LOG_LEVELS))}")
+    environment = os.environ.get("ETL_ENV", "production").strip().lower()
+    suppressed = False
+    level = requested
+    if environment not in _DEV_ENVS and requested == "DEBUG":
+        level = "INFO"
+        suppressed = True
     return LoggingConfig(
         level=level,
         file=_resolve_path(_as_str(section.get("file"), field="logging.file", default="logs/etl.log"), base_dir),
@@ -488,7 +569,9 @@ def _parse_logging(data: dict[str, Any], base_dir: Path) -> LoggingConfig:
             field="logging.max_bytes",
             default=5_242_880,
             minimum=1024,
+            maximum=52_428_800,
         ),
+        debug_suppressed=suppressed,
         backup_count=_as_int(
             section.get("backup_count"),
             field="logging.backup_count",
@@ -500,6 +583,8 @@ def _parse_logging(data: dict[str, Any], base_dir: Path) -> LoggingConfig:
 
 
 def _resolve_path(value: str, base_dir: Path) -> Path:
+    if any(character in value for character in "\r\n\x00"):
+        raise ConfigError("paths must not contain control characters")
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = base_dir / path
@@ -524,6 +609,8 @@ def _as_str(value: Any, *, field: str, default: str | None = None) -> str:
         return default
     if text == "":
         raise ConfigError(f"{field} is required")
+    if any(character in text for character in "\r\n\x00"):
+        raise ConfigError(f"{field} must be a single line")
     return text
 
 
@@ -600,4 +687,7 @@ def _as_cron(value: Any, *, default: str, field: str) -> str:
         text = str(value).strip()
     if not text:
         raise ConfigError(f"{field} cannot be empty")
-    return text
+    try:
+        return CronField(value=text).value
+    except ValidationError:
+        raise ConfigError(f"{field} is not a valid cron field") from None

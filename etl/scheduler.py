@@ -14,10 +14,11 @@ from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 from etl.config import load_config
-from etl.errors import ConfigError
+from etl.errors import ConfigError, EtlError
 from etl.heartbeat import write_heartbeat
 from etl.pipeline import run_pipeline
-from etl.runtime import bootstrap, parse_args
+from etl.redaction import redact_text
+from etl.runtime import bootstrap, harden_process, parse_args
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,19 @@ def _scheduled_run(config_path: str) -> None:
         config = load_config(config_path)
         result = run_pipeline(config)
         if result.warnings:
-            logger.error("Scheduled run finished with ingest errors: %s", "; ".join(result.warnings))
+            logger.error(
+                "Scheduled run finished with ingest errors: %s",
+                redact_text("; ".join(result.warnings)),
+            )
+    except (ConfigError, EtlError) as exc:
+        logger.error("Scheduled run failed: %s", redact_text(str(exc)))
     except Exception:
-        logger.exception("ETL run failed")
+        logger.error("Scheduled run failed due to an unexpected error")
 
 
 def main(argv: list[str] | None = None) -> int:
     """Start the blocking scheduler. Configuration errors exit before the loop."""
+    harden_process()
     args = parse_args(
         argv,
         prog="etl-scheduler",
@@ -44,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = bootstrap(args.config)
     except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        print(f"Configuration error: {redact_text(str(exc))}", file=sys.stderr)
         return 2
 
     write_heartbeat(config.app.heartbeat_file)

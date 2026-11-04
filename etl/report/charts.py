@@ -14,6 +14,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from etl.validation import resolve_child
+
 _PALETTE = ("#1b4f72", "#b9770e", "#117a65", "#6c3483", "#922b21", "#1a5276")
 _EMPTY_MESSAGE = "No observations in the lookback window"
 
@@ -29,21 +31,21 @@ def render_report(df: pd.DataFrame, output_dir: Path, report_date: date) -> list
             "temp_mean_c",
             "Daily mean temperature",
             "Temperature (°C)",
-            output_dir / f"temperature_{stamp}.png",
+            resolve_child(output_dir, f"temperature_{stamp}.png"),
         ),
         _bar_chart(
             frame,
             "precipitation_sum_mm",
             "Daily precipitation",
             "Precipitation (mm)",
-            output_dir / f"precipitation_{stamp}.png",
+            resolve_child(output_dir, f"precipitation_{stamp}.png"),
         ),
         _line_chart(
             frame,
             "wind_speed_mean_kmh",
             "Daily mean wind speed",
             "Wind speed (km/h)",
-            output_dir / f"wind_{stamp}.png",
+            resolve_child(output_dir, f"wind_{stamp}.png"),
         ),
     ]
 
@@ -150,6 +152,8 @@ def _colors(locations: list[str]) -> dict[str, str]:
 
 
 def _save(fig: plt.Figure, path: Path) -> Path:
+    if path.is_symlink():
+        raise OSError("refusing to write a chart through a symlink")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)

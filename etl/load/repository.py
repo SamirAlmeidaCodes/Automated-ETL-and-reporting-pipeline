@@ -38,7 +38,8 @@ def create_db_engine(url: str) -> Engine:
         raw_path = url[len("sqlite:///") :]
         if raw_path and raw_path != ":memory:":
             Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(url, poolclass=NullPool)
+    # hide_parameters keeps bound values out of database error text. echo stays off.
+    engine = create_engine(url, poolclass=NullPool, echo=False, hide_parameters=True)
     if url.startswith("sqlite"):
         event.listen(engine, "connect", _configure_sqlite)
     return engine
@@ -128,7 +129,11 @@ def _python_value(column: str, value: Any) -> Any:
     if column == "observation_count":
         return int(value)
     if column in {"location_name", "source"}:
-        return str(value)
+        text = "".join(character for character in str(value) if character.isprintable()).strip()
+        limit = 256 if column == "location_name" else 128
+        if not text:
+            raise LoadError(f"Daily row is missing {column}")
+        return text[:limit]
     return float(value)
 
 

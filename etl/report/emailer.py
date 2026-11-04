@@ -15,6 +15,7 @@ import pandas as pd
 
 from etl.config import EmailConfig
 from etl.errors import EmailError
+from etl.validation import CHART_NAME, MAX_CHART_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,9 @@ def send_report(config: EmailConfig, context: ReportContext) -> None:
     message = build_message(config, context)
     try:
         _deliver(config, message)
-    except (smtplib.SMTPException, OSError) as exc:
-        raise EmailError(f"Could not send the report email: {exc}") from exc
+    except (smtplib.SMTPException, OSError):
+        logger.error("SMTP delivery failed")
+        raise EmailError("Could not send the report email") from None
     logger.info("Sent the report to %s", ", ".join(config.to_addrs))
 
 
@@ -52,13 +54,30 @@ def build_message(config: EmailConfig, context: ReportContext) -> EmailMessage:
     message["Date"] = format_datetime(generated)
     message.set_content(_body(context))
     for path in context.charts:
+        payload, filename = _read_chart(path)
         message.add_attachment(
-            path.read_bytes(),
+            payload,
             maintype="image",
             subtype="png",
-            filename=path.name,
+            filename=filename,
         )
     return message
+
+
+def _read_chart(path: Path) -> tuple[bytes, str]:
+    """Read one report PNG. Reject symlinks, unexpected names, and oversized files."""
+    filename = path.name
+    if not CHART_NAME.fullmatch(filename) or path.is_symlink():
+        raise EmailError("Refusing to attach an unexpected report file")
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_CHART_BYTES:
+            raise EmailError("Refusing to attach an unexpected report file")
+        payload = path.read_bytes()
+    except OSError:
+        raise EmailError("Refusing to attach an unexpected report file") from None
+    if not payload.startswith(b"\x89PNG"):
+        raise EmailError("Refusing to attach an unexpected report file")
+    return payload, filename
 
 
 def _deliver(config: EmailConfig, message: EmailMessage) -> None:
@@ -104,7 +123,7 @@ def _body(context: ReportContext) -> str:
             match = frame[(frame["location_name"] == location) & (frame["observation_date"] == day)]
             row = match.iloc[-1]
             lines.append(
-                f"{str(location)[:24]:<24} {_date_text(day):<12} "
+                f"{_cell(location, 24):<24} {_date_text(day):<12} "
                 f"{_num(row['temp_mean_c']):>8} {_num(row['precipitation_sum_mm']):>10} "
                 f"{_num(row['wind_speed_mean_kmh']):>10}"
             )
@@ -122,6 +141,11 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _cell(value: Any, width: int) -> str:
+    text = "".join(character for character in str(value) if character.isprintable()).strip()
+    return text[:width]
 
 
 def _date_text(value: Any) -> str:

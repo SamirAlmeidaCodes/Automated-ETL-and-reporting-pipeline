@@ -14,9 +14,21 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
+    # 1000 matches the image user. Override UID and GID so host bind mounts stay writable.
     user: "${UID:-1000}:${GID:-1000}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
+      ETL_ENV: ${ETL_ENV:-production}
       ETL_CONFIG: /app/config.yaml
+      HOME: /tmp
+      MPLCONFIGDIR: /tmp/matplotlib
+      # SMTP values come from the shell or .env. They are not baked into the image.
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}

@@ -109,6 +109,7 @@ Schedule changes apply after a process restart. Location, path, and email edits 
 | `SMTP_USE_TLS` | STARTTLS. Default `true`. |
 | `SMTP_USE_SSL` | Implicit TLS, typically port 465. Cannot be combined with STARTTLS. |
 | `UID`, `GID` | Host user used by `docker compose` so bind-mounted files stay writable. |
+| `ETL_ENV` | `production` by default. `DEBUG` logs are kept only when this is `development`, `dev`, or `test`. |
 
 Copy the template and fill in mail only when you want delivery:
 
@@ -190,7 +191,7 @@ The healthcheck reads `data/heartbeat.txt`. The scheduler writes that file on st
 | `source` | Distinct source labels |
 | `loaded_at` | UTC time of the load, stored without a timezone suffix |
 
-SQLite is opened in WAL mode. Tables are created on startup. Delete `data/weather.db` to drop the history.
+SQLite is opened in WAL mode. Tables are created on startup. The database file is local and gitignored. Delete `data/weather.db` to drop the history.
 
 ## Tests
 
@@ -218,9 +219,29 @@ data/inbox/            drop CSVs here
 data/archive/          files moved after a successful load
 data/samples/          example hourly CSV
 output/reports/        PNG charts
-logs/etl.log           rotating log
+logs/etl.log           rotating log, gitignored
+scripts/audit_dependencies.sh
 tests/                 pytest
 ```
+
+## Security notes
+
+Secrets stay in the environment, not in git and not in the image.
+
+- Copy `.env.example` to `.env` and put the real SMTP password only in `.env`. `.env` is gitignored. The example file contains placeholders such as `replace-with-a-real-password`.
+- `email.smtp_password` in `config.yaml` must be an environment placeholder with an empty default, `${SMTP_PASSWORD:-}`. The loader rejects a literal password or a default secret.
+- The password is read from the environment, removed from log lines, and left out of the email. Logs do not include stack traces.
+- `ETL_ENV=production` is the default. It forces the log level to INFO. Use `ETL_ENV=development` only when you want DEBUG output on a machine you control.
+- The process creates files with umask `027`. The container runs as user `etl` (uid 1000), drops Linux capabilities, and uses a read-only root filesystem. `docker compose` can override the uid so the bind mounts stay writable. `.env`, local databases, and logs are excluded from the image build.
+- CSV reads stay inside the inbox, skip symlinks, and reject unsafe file names. Chart files are written only inside the report directory. Database statements use bound parameters.
+- This project does not serve HTTP, so browser security headers, CORS, and inbound rate limits are not used. Outbound forecast requests require HTTPS, do not follow redirects, and stop when a response is too large.
+- Check dependencies from the project root:
+
+```bash
+scripts/audit_dependencies.sh
+```
+
+The script installs `pip-audit` into the active environment if it is missing. `python -m pip install safety && safety check -r requirements.txt` is an equivalent check.
 
 ## Operational notes
 

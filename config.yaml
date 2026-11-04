@@ -59,6 +59,8 @@ report:
   lookback_days: 14
 
 email:
+  # The password is an environment placeholder with an empty default.
+  # Do not put a literal secret here. The loader rejects one.
   enabled: false
   smtp_host: ${SMTP_HOST:-}
   smtp_port: ${SMTP_PORT:-587}
@@ -73,6 +75,7 @@ email:
   subject: "Daily weather report {date}"
 
 logging:
+  # DEBUG is raised to INFO unless ETL_ENV is development, dev, or test.
   level: INFO
   file: logs/etl.log
   max_bytes: 5242880

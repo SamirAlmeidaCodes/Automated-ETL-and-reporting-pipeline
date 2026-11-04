@@ -7,9 +7,11 @@ import math
 from typing import Any
 
 import pandas as pd
+from pydantic import ValidationError
 
 from etl.errors import TransformError
 from etl.schema import DAILY_COLUMNS, HOURLY_COLUMNS, METRIC_COLUMNS
+from etl.validation import LocationLabel, SourceLabel
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +208,10 @@ def _ensure_utc(series: pd.Series) -> pd.Series:
 def _clean_location(value: Any) -> str | None:
     if _is_missing(value):
         return None
-    text = str(value).strip()
+    try:
+        text = LocationLabel(value=value).value
+    except ValidationError:
+        return None
     if not text or text.lower() == "nan":
         return None
     return text
@@ -215,8 +220,10 @@ def _clean_location(value: Any) -> str | None:
 def _clean_source(value: Any) -> str:
     if _is_missing(value):
         return "unknown"
-    text = str(value).strip()
-    return text or "unknown"
+    try:
+        return SourceLabel(value=value).value
+    except ValidationError:
+        return "unknown"
 
 
 def _join_sources(values: pd.Series) -> str:
